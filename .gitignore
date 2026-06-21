@@ -1,0 +1,17 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+ENV/
+
+# Datasets and Weights (Do not upload large datasets or models to GitHub)
+Emotions_Datasets/
+*.h5
+
+# OS generated files
+.DS_Store
+Thumbs.db
