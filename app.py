@@ -10,7 +10,7 @@ def main():
 
     # Load model and define rigid class order matching directory structure
     model = tf.keras.models.load_model(model_path)
-    class_names = ['anger', 'fear', 'happiness', 'neutrality', 'sadness']
+    class_names = ['Angry', 'Happy', 'Sad', 'Suprise']
 
     # Initialize OpenCV Haar Cascade face detector
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
