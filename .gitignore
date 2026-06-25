@@ -10,6 +10,7 @@ ENV/
 
 # Datasets and Weights (Do not upload large datasets or models to GitHub)
 Emotions_Datasets/
+Balanced_Dataset/
 *.h5
 
 # OS generated files
