@@ -76,7 +76,7 @@ MIN_CONFIDENCE = 35.0
 
 # Maximum distance in pixels between the previous center and
 # current center for the same person.
-MAX_TRACK_DISTANCE = 120
+MAX_TRACK_DISTANCE = 180
 
 # Number of frames a person can disappear before being removed.
 MAX_MISSING_FRAMES = 15
@@ -98,6 +98,11 @@ CAMERA_INDEX = 0
 
 CAMERA_WIDTH = 960
 CAMERA_HEIGHT = 720
+
+# --------------------------------------------------------------
+# Performance monitoring
+# --------------------------------------------------------------
+FPS_SMOOTHING = 0.9
 
 
 # ======================================================================
@@ -618,6 +623,14 @@ class FaceTracker:
 
         matched_people = set()
 
+        # Keep a single visible person on the same track despite small
+        # Haar-Cascade bounding-box jitter.
+        if len(detected_faces) == 1 and len(self.people) == 1:
+            person = next(iter(self.people.values()))
+            person.update(detected_faces[0])
+            person.missing_frames = 0
+            return [person]
+
         results = []
 
         # --------------------------------------------------------------
@@ -788,6 +801,9 @@ def get_emotion_color(emotion):
 def draw_person(
     frame,
     person,
+    display_emotion=None,
+    display_confidence=None,
+    is_primary=False,
 ):
 
     x = person.x
@@ -795,9 +811,17 @@ def draw_person(
     w = person.w
     h = person.h
 
-    emotion = person.current_emotion
+    emotion = (
+        display_emotion
+        if display_emotion is not None
+        else person.current_emotion
+    )
 
-    confidence = person.current_confidence
+    confidence = (
+        display_confidence
+        if display_confidence is not None
+        else person.current_confidence
+    )
 
     color = get_emotion_color(
         emotion
@@ -812,8 +836,35 @@ def draw_person(
         (x, y),
         (x + w, y + h),
         color,
-        3,
+        4 if is_primary else 3,
     )
+
+    # Clearly mark the largest face as the primary person.
+    if is_primary:
+        primary_text = "PRIMARY"
+        (pw, ph), _ = cv2.getTextSize(
+            primary_text,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            2,
+        )
+        py = max(ph + 8, y - 38)
+        cv2.rectangle(
+            frame,
+            (x, py - ph - 6),
+            (x + pw + 10, py + 5),
+            (255, 255, 255),
+            -1,
+        )
+        cv2.putText(
+            frame,
+            primary_text,
+            (x + 5, py),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 0),
+            2,
+        )
 
     # --------------------------------------------------------------
     # Person ID
@@ -933,24 +984,34 @@ def speak_reaction(
     engine,
     emotion,
 ):
+    """Speak the reaction reliably on Windows using SAPI/pyttsx3."""
 
     if emotion not in REACTIONS:
-
         return
 
-    message = REACTIONS[
-        emotion
-    ]
+    message = REACTIONS[emotion]
+    print(f"Voice reaction: {message}")
 
-    print(
-        f"Voice reaction: {message}"
-    )
+    speech_engine = None
 
-    engine.say(
-        message
-    )
+    try:
+        # Reinitialize SAPI for every utterance. This avoids a common
+        # Windows pyttsx3 issue where only the first utterance is heard.
+        speech_engine = pyttsx3.init(driverName="sapi5")
+        speech_engine.setProperty("rate", 150)
+        speech_engine.setProperty("volume", 1.0)
+        speech_engine.say(message)
+        speech_engine.runAndWait()
 
-    engine.runAndWait()
+    except Exception as error:
+        print(f"Voice error: {error}")
+
+    finally:
+        if speech_engine is not None:
+            try:
+                speech_engine.stop()
+            except Exception:
+                pass
 
 
 # ======================================================================
@@ -1054,6 +1115,13 @@ def main():
 
     last_speak_time = {}
 
+    # Performance metrics
+    fps = 0.0
+    frame_count = 0
+    total_detection_time = 0.0
+    total_inference_time = 0.0
+    total_frame_time = 0.0
+
     print("=" * 65)
     print("READY!")
     print(
@@ -1066,6 +1134,8 @@ def main():
     # ==================================================================
 
     while True:
+
+        frame_start = time.perf_counter()
 
         ret, frame = cap.read()
 
@@ -1107,12 +1177,16 @@ def main():
         # Detect faces
         # ----------------------------------------------------------
 
+        detection_start = time.perf_counter()
         faces = face_cascade.detectMultiScale(
             gray,
             scaleFactor=FACE_SCALE_FACTOR,
             minNeighbors=FACE_MIN_NEIGHBORS,
             minSize=FACE_MIN_SIZE,
         )
+
+        detection_time = time.perf_counter() - detection_start
+        total_detection_time += detection_time
 
         # Convert to regular list
         detected_faces = [
@@ -1139,8 +1213,21 @@ def main():
         )
 
         # ----------------------------------------------------------
+        # Select primary person
+        # ----------------------------------------------------------
+        # The largest detected face is the primary person.
+        primary_person = None
+        if people:
+            primary_person = max(
+                people,
+                key=lambda p: p.w * p.h,
+            )
+
+        # ----------------------------------------------------------
         # Process every person
         # ----------------------------------------------------------
+
+        inference_start = time.perf_counter()
 
         for person in people:
 
@@ -1254,6 +1341,22 @@ def main():
             )
 
             # ------------------------------------------------------
+            # Confidence filtering
+            # ------------------------------------------------------
+
+            if confidence < MIN_CONFIDENCE:
+                # Low-confidence predictions are shown as uncertain and are
+                # not added to the temporal history.
+                draw_person(
+                    frame,
+                    person,
+                    display_emotion="Uncertain",
+                    display_confidence=confidence,
+                    is_primary=(person is primary_person),
+                )
+                continue
+
+            # ------------------------------------------------------
             # Add prediction to person's history
             # ------------------------------------------------------
 
@@ -1275,70 +1378,77 @@ def main():
             draw_person(
                 frame,
                 person,
+                is_primary=(person is primary_person),
             )
 
-            # ------------------------------------------------------
-            # Voice reaction
-            # ------------------------------------------------------
+        inference_time = time.perf_counter() - inference_start
+        total_inference_time += inference_time
 
-            if (
-                VOICE_ENABLED
-                and new_emotion in REACTIONS
-            ):
+        # --------------------------------------------------------------
+        # Primary-person voice reaction
+        # --------------------------------------------------------------
+        # The largest detected face is treated as the primary person.
+        # Only the primary person's stable emotion can trigger speech.
+        # The primary person is always the largest detected face.
+        # Voice feedback is triggered only when that person's stabilized
+        # emotion has a defined reaction.
+        if (
+            VOICE_ENABLED
+            and primary_person is not None
+            and primary_person.current_emotion in REACTIONS
+        ):
+            primary_emotion = primary_person.current_emotion
+            current_time = time.time()
 
-                current_time = time.time()
+            previous_spoken = last_spoken.get(
+                primary_person.person_id
+            )
+            previous_time = last_speak_time.get(
+                primary_person.person_id,
+                0,
+            )
 
-                previous_spoken = (
-                    last_spoken.get(
-                        person.person_id
-                    )
+            emotion_changed = (
+                primary_emotion != previous_spoken
+            )
+            enough_time = (
+                current_time - previous_time
+                >= SPEAK_COOLDOWN
+            )
+
+            if emotion_changed and enough_time:
+                print(
+                    f"Primary Person "
+                    f"{primary_person.person_id}: "
+                    f"{primary_emotion}"
                 )
-
-                previous_time = (
-                    last_speak_time.get(
-                        person.person_id,
-                        0,
-                    )
+                speak_reaction(
+                    engine,
+                    primary_emotion,
                 )
+                last_spoken[
+                    primary_person.person_id
+                ] = primary_emotion
+                last_speak_time[
+                    primary_person.person_id
+                ] = current_time
 
-                emotion_changed = (
-                    new_emotion
-                    != previous_spoken
-                )
+        # --------------------------------------------------------------
+        # Frame performance
+        # --------------------------------------------------------------
+        frame_time = time.perf_counter() - frame_start
+        total_frame_time += frame_time
+        frame_count += 1
 
-                enough_time = (
-                    current_time
-                    - previous_time
-                    >= SPEAK_COOLDOWN
-                )
-
-                if (
-                    emotion_changed
-                    and enough_time
-                ):
-
-                    print(
-                        f"Person "
-                        f"{person.person_id}: "
-                        f"{new_emotion}"
-                    )
-
-                    speak_reaction(
-                        engine,
-                        new_emotion,
-                    )
-
-                    last_spoken[
-                        person.person_id
-                    ] = new_emotion
-
-                    last_speak_time[
-                        person.person_id
-                    ] = current_time
+        instant_fps = 1.0 / frame_time if frame_time > 0 else 0.0
+        if fps <= 0:
+            fps = instant_fps
+        else:
+            fps = FPS_SMOOTHING * fps + (1.0 - FPS_SMOOTHING) * instant_fps
 
         # ==============================================================
         # TOP STATUS BAR
-        # ==============================================================
+        # =============================================================
 
         overlay = frame.copy()
 
@@ -1347,7 +1457,7 @@ def main():
             (0, 0),
             (
                 frame.shape[1],
-                55,
+                65,
             ),
             (20, 20, 20),
             -1,
@@ -1380,21 +1490,71 @@ def main():
         # People count
         # --------------------------------------------------------------
 
-        count_text = (
-            f"People: {len(people)}"
-        )
+        count_text = f"People: {len(people)}"
 
         cv2.putText(
             frame,
             count_text,
-            (
-                frame.shape[1] - 150,
-                25,
-            ),
+            (frame.shape[1] - 150, 25),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (0, 255, 255),
             2,
+        )
+
+        # Primary-person status
+        primary_status = "Primary: None"
+        if primary_person is not None:
+            primary_emotion_display = primary_person.current_emotion
+            if primary_emotion_display == "Detecting...":
+                primary_status = f"Primary: Person {primary_person.person_id}"
+            else:
+                primary_status = (
+                    f"Primary: P{primary_person.person_id} - "
+                    f"{primary_emotion_display}"
+                )
+
+        cv2.putText(
+            frame,
+            primary_status,
+            (frame.shape[1] - 350, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (255, 255, 255),
+            1,
+        )
+
+        # --------------------------------------------------------------
+        # Performance metrics
+        # --------------------------------------------------------------
+        perf_text = (
+            f"FPS: {fps:.1f} | Detect: {detection_time * 1000:.0f} ms | "
+            f"Inference: {inference_time * 1000:.0f} ms"
+        )
+
+        cv2.putText(
+            frame,
+            perf_text,
+            (15, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (200, 200, 200),
+            1,
+        )
+
+        # --------------------------------------------------------------
+        # Demo legend
+        # --------------------------------------------------------------
+
+        legend_text = "PRIMARY = largest face | Voice reacts only to PRIMARY"
+        cv2.putText(
+            frame,
+            legend_text,
+            (15, frame.shape[0] - 38),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (200, 200, 200),
+            1,
         )
 
         # --------------------------------------------------------------
@@ -1443,6 +1603,18 @@ def main():
     print(
         "Stopping..."
     )
+
+    if frame_count > 0:
+        avg_detection_ms = (total_detection_time / frame_count) * 1000
+        avg_inference_ms = (total_inference_time / frame_count) * 1000
+        avg_frame_ms = (total_frame_time / frame_count) * 1000
+        avg_fps = 1000.0 / avg_frame_ms if avg_frame_ms > 0 else 0.0
+
+        print("Performance summary:")
+        print(f"  Average FPS: {avg_fps:.2f}")
+        print(f"  Average face detection time: {avg_detection_ms:.2f} ms")
+        print(f"  Average inference time: {avg_inference_ms:.2f} ms")
+        print(f"  Average frame processing time: {avg_frame_ms:.2f} ms")
 
     cap.release()
 
