@@ -1,208 +1,1462 @@
+"""
+Multi-Person Emotion Detection - Improved Live Webcam Demo
+------------------------------------------------------------
+
+Features:
+- Multiple face detection
+- Stable Person IDs
+- Emotion smoothing over multiple frames
+- Confidence smoothing
+- Per-person emotion history
+- Voice reactions with cooldown
+- Better OpenCV UI
+- Loads the newer .keras model manually so it works with
+  TensorFlow 2.13 / Keras 2.13
+"""
+
+import io
 import os
+import time
+import zipfile
+from collections import Counter, deque
+
 import cv2
+import h5py
 import numpy as np
 import tensorflow as tf
 import pyttsx3
-import threading
-import time
-import mediapipe as mp
 
-def robot_speak(text):
-    """Threaded Voice Helper to prevent video feed lagging/freezing"""
-    def speech_worker(words):
-        try:
-            engine = pyttsx3.init()
-            engine.setProperty('rate', 145) 
-            engine.say(words)
-            engine.runAndWait()
-        except Exception as e:
-            pass 
 
-    threading.Thread(target=speech_worker, args=(text,), daemon=True).start()
+# ======================================================================
+# SETTINGS
+# ======================================================================
 
-def draw_robot_face(emotion):
-    """Draws a minimalist digital robot face canvas based on current emotion."""
-    canvas = np.zeros((400, 400, 3), dtype=np.uint8)
-    color = (255, 255, 0) # Cyan
-    
-    if emotion == 'Happy':
-        cv2.circle(canvas, (130, 150), 30, color, -1)
-        cv2.circle(canvas, (270, 150), 30, color, -1)
-        cv2.rectangle(canvas, (90, 150), (170, 190), (0, 0, 0), -1)
-        cv2.rectangle(canvas, (230, 150), (310, 190), (0, 0, 0), -1)
-        cv2.ellipse(canvas, (200, 260), (60, 40), 0, 0, 180, color, 5)
-        
-    elif emotion == 'Sad':
-        cv2.line(canvas, (100, 160), (150, 140), color, 5)
-        cv2.line(canvas, (300, 160), (250, 140), color, 5)
-        cv2.ellipse(canvas, (200, 290), (50, 30), 0, 180, 360, color, 5)
-        
-    elif emotion == 'Angry':
-        cv2.circle(canvas, (130, 160), 25, color, -1)
-        cv2.circle(canvas, (270, 160), 25, color, -1)
-        cv2.line(canvas, (90, 120), (160, 150), color, 6)
-        cv2.line(canvas, (310, 120), (240, 150), color, 6)
-        cv2.line(canvas, (150, 270), (250, 270), color, 5)
-        
-    elif emotion in ['Suprise']:
-        cv2.circle(canvas, (130, 150), 35, color, 4)
-        cv2.circle(canvas, (270, 150), 35, color, 4)
-        cv2.circle(canvas, (200, 270), 25, color, 4)
-        
-    else: # Neutral / Default state
-        cv2.circle(canvas, (130, 150), 25, color, -1)
-        cv2.circle(canvas, (270, 150), 25, color, -1)
-        cv2.line(canvas, (160, 270), (240, 270), color, 4)
-        
-    return canvas
+MODEL_PATH = "emotion_detection_model.keras"
 
-def handle_robot_reaction(emotion):
-    """Returns spoken words and updates text labels based on image requirements."""
-    if emotion == 'Happy':
-        return "I am glad to see you smiling back!", "*Robot smiles back*"
-    elif emotion == 'Sad':
-        return "Are you okay? Let me offer you some comfort.", "Robot asks: 'Are you okay?' & offers comfort"
-    elif emotion == 'Angry':
-        return "Please remain calm.", "*Robot assumes calm expression*"
-    elif emotion in ['Suprise']:
-        return "Oh wow! You caught me off guard!", "*Robot reacts with surprise*"
+EMOTIONS = [
+    "Angry",
+    "Happy",
+    "Neutral",
+    "Sad",
+    "Surprise",
+]
+
+REACTIONS = {
+    "Happy": "I am glad to see you smiling!",
+    "Sad": "Are you okay? I am here for you.",
+    "Angry": "Please stay calm.",
+    "Surprise": "Oh, that surprised me too!",
+}
+
+# --------------------------------------------------------------
+# Face detection
+# --------------------------------------------------------------
+
+FACE_SCALE_FACTOR = 1.1
+FACE_MIN_NEIGHBORS = 5
+FACE_MIN_SIZE = (60, 60)
+
+# --------------------------------------------------------------
+# Emotion smoothing
+# --------------------------------------------------------------
+
+# Number of predictions kept for each person.
+EMOTION_HISTORY_SIZE = 12
+
+# Minimum number of identical predictions required before
+# changing the displayed emotion.
+MIN_STABLE_COUNT = 7
+
+# Minimum confidence required before accepting a prediction.
+MIN_CONFIDENCE = 35.0
+
+# --------------------------------------------------------------
+# Person tracking
+# --------------------------------------------------------------
+
+# Maximum distance in pixels between the previous center and
+# current center for the same person.
+MAX_TRACK_DISTANCE = 120
+
+# Number of frames a person can disappear before being removed.
+MAX_MISSING_FRAMES = 15
+
+# --------------------------------------------------------------
+# Voice
+# --------------------------------------------------------------
+
+SPEAK_COOLDOWN = 5
+
+# Set to True if you want voice reactions.
+VOICE_ENABLED = True
+
+# --------------------------------------------------------------
+# Camera
+# --------------------------------------------------------------
+
+CAMERA_INDEX = 0
+
+CAMERA_WIDTH = 960
+CAMERA_HEIGHT = 720
+
+
+# ======================================================================
+# MODEL ARCHITECTURE
+# ======================================================================
+
+def build_emotion_model():
+    """
+    Recreates the architecture contained in emotion_detection_model.keras.
+    """
+
+    preprocessing = tf.keras.Sequential(
+        [
+            tf.keras.layers.InputLayer(
+                input_shape=(48, 48, 1),
+                name="input_layer",
+            ),
+
+            tf.keras.layers.RandomFlip(
+                mode="horizontal",
+                name="random_flip",
+            ),
+
+            tf.keras.layers.RandomRotation(
+                factor=(-0.05, 0.05),
+                fill_mode="reflect",
+                interpolation="bilinear",
+                name="random_rotation",
+            ),
+        ],
+        name="sequential",
+    )
+
+    model = tf.keras.Sequential(
+        [
+            tf.keras.layers.InputLayer(
+                input_shape=(48, 48, 1),
+                name="input_layer_1",
+            ),
+
+            preprocessing,
+
+            # ----------------------------------------------------------
+            # Block 1
+            # ----------------------------------------------------------
+
+            tf.keras.layers.Conv2D(
+                32,
+                (3, 3),
+                strides=(1, 1),
+                padding="valid",
+                activation="relu",
+                name="conv2d",
+            ),
+
+            tf.keras.layers.MaxPooling2D(
+                pool_size=(2, 2),
+                strides=(2, 2),
+                padding="valid",
+                name="max_pooling2d",
+            ),
+
+            tf.keras.layers.BatchNormalization(
+                axis=-1,
+                momentum=0.99,
+                epsilon=0.001,
+                name="batch_normalization",
+            ),
+
+            # ----------------------------------------------------------
+            # Block 2
+            # ----------------------------------------------------------
+
+            tf.keras.layers.Conv2D(
+                64,
+                (3, 3),
+                strides=(1, 1),
+                padding="valid",
+                activation="relu",
+                name="conv2d_1",
+            ),
+
+            tf.keras.layers.MaxPooling2D(
+                pool_size=(2, 2),
+                strides=(2, 2),
+                padding="valid",
+                name="max_pooling2d_1",
+            ),
+
+            tf.keras.layers.BatchNormalization(
+                axis=-1,
+                momentum=0.99,
+                epsilon=0.001,
+                name="batch_normalization_1",
+            ),
+
+            # ----------------------------------------------------------
+            # Block 3
+            # ----------------------------------------------------------
+
+            tf.keras.layers.Conv2D(
+                128,
+                (3, 3),
+                strides=(1, 1),
+                padding="valid",
+                activation="relu",
+                name="conv2d_2",
+            ),
+
+            tf.keras.layers.MaxPooling2D(
+                pool_size=(2, 2),
+                strides=(2, 2),
+                padding="valid",
+                name="max_pooling2d_2",
+            ),
+
+            tf.keras.layers.BatchNormalization(
+                axis=-1,
+                momentum=0.99,
+                epsilon=0.001,
+                name="batch_normalization_2",
+            ),
+
+            # ----------------------------------------------------------
+            # Classifier
+            # ----------------------------------------------------------
+
+            tf.keras.layers.Flatten(
+                name="flatten",
+            ),
+
+            tf.keras.layers.Dense(
+                128,
+                activation="relu",
+                name="dense",
+            ),
+
+            tf.keras.layers.Dropout(
+                0.6,
+                name="dropout",
+            ),
+
+            tf.keras.layers.Dense(
+                5,
+                activation="softmax",
+                name="dense_1",
+            ),
+        ],
+        name="emotion_model",
+    )
+
+    return model
+
+
+# ======================================================================
+# LOAD MODEL
+# ======================================================================
+
+def load_emotion_model(model_path):
+    """
+    Manually loads model weights from the .keras archive.
+
+    This avoids the InputLayer compatibility problem caused by loading
+    a newer Keras model with TensorFlow/Keras 2.13.
+    """
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"Model file not found:\n{os.path.abspath(model_path)}"
+        )
+
+    print("Building model architecture...")
+
+    model = build_emotion_model()
+
+    # Build variables
+    dummy_input = np.zeros(
+        (1, 48, 48, 1),
+        dtype=np.float32,
+    )
+
+    model(dummy_input, training=False)
+
+    print("Reading weights from model file...")
+
+    with zipfile.ZipFile(model_path, "r") as archive:
+
+        if "model.weights.h5" not in archive.namelist():
+            raise RuntimeError(
+                "model.weights.h5 was not found inside "
+                + model_path
+            )
+
+        weight_data = archive.read(
+            "model.weights.h5"
+        )
+
+    print("Loading model weights...")
+
+    with h5py.File(
+        io.BytesIO(weight_data),
+        "r",
+    ) as weights_file:
+
+        layers = weights_file["layers"]
+
+        # --------------------------------------------------------------
+        # Conv2D 32
+        # --------------------------------------------------------------
+
+        model.get_layer("conv2d").set_weights(
+            [
+                np.array(
+                    layers["conv2d"]["vars"]["0"]
+                ),
+                np.array(
+                    layers["conv2d"]["vars"]["1"]
+                ),
+            ]
+        )
+
+        # --------------------------------------------------------------
+        # BatchNorm 32
+        # --------------------------------------------------------------
+
+        model.get_layer(
+            "batch_normalization"
+        ).set_weights(
+            [
+                np.array(
+                    layers["batch_normalization"]["vars"]["0"]
+                ),
+                np.array(
+                    layers["batch_normalization"]["vars"]["1"]
+                ),
+                np.array(
+                    layers["batch_normalization"]["vars"]["2"]
+                ),
+                np.array(
+                    layers["batch_normalization"]["vars"]["3"]
+                ),
+            ]
+        )
+
+        # --------------------------------------------------------------
+        # Conv2D 64
+        # --------------------------------------------------------------
+
+        model.get_layer("conv2d_1").set_weights(
+            [
+                np.array(
+                    layers["conv2d_1"]["vars"]["0"]
+                ),
+                np.array(
+                    layers["conv2d_1"]["vars"]["1"]
+                ),
+            ]
+        )
+
+        # --------------------------------------------------------------
+        # BatchNorm 64
+        # --------------------------------------------------------------
+
+        model.get_layer(
+            "batch_normalization_1"
+        ).set_weights(
+            [
+                np.array(
+                    layers["batch_normalization_1"]["vars"]["0"]
+                ),
+                np.array(
+                    layers["batch_normalization_1"]["vars"]["1"]
+                ),
+                np.array(
+                    layers["batch_normalization_1"]["vars"]["2"]
+                ),
+                np.array(
+                    layers["batch_normalization_1"]["vars"]["3"]
+                ),
+            ]
+        )
+
+        # --------------------------------------------------------------
+        # Conv2D 128
+        # --------------------------------------------------------------
+
+        model.get_layer("conv2d_2").set_weights(
+            [
+                np.array(
+                    layers["conv2d_2"]["vars"]["0"]
+                ),
+                np.array(
+                    layers["conv2d_2"]["vars"]["1"]
+                ),
+            ]
+        )
+
+        # --------------------------------------------------------------
+        # BatchNorm 128
+        # --------------------------------------------------------------
+
+        model.get_layer(
+            "batch_normalization_2"
+        ).set_weights(
+            [
+                np.array(
+                    layers["batch_normalization_2"]["vars"]["0"]
+                ),
+                np.array(
+                    layers["batch_normalization_2"]["vars"]["1"]
+                ),
+                np.array(
+                    layers["batch_normalization_2"]["vars"]["2"]
+                ),
+                np.array(
+                    layers["batch_normalization_2"]["vars"]["3"]
+                ),
+            ]
+        )
+
+        # --------------------------------------------------------------
+        # Dense 2048 -> 128
+        # --------------------------------------------------------------
+
+        model.get_layer("dense").set_weights(
+            [
+                np.array(
+                    layers["dense"]["vars"]["0"]
+                ),
+                np.array(
+                    layers["dense"]["vars"]["1"]
+                ),
+            ]
+        )
+
+        # --------------------------------------------------------------
+        # Dense 128 -> 5
+        # --------------------------------------------------------------
+
+        model.get_layer("dense_1").set_weights(
+            [
+                np.array(
+                    layers["dense_1"]["vars"]["0"]
+                ),
+                np.array(
+                    layers["dense_1"]["vars"]["1"]
+                ),
+            ]
+        )
+
+    print("Model weights loaded successfully.")
+
+    return model
+
+
+# ======================================================================
+# PERSON TRACK
+# ======================================================================
+
+class PersonTrack:
+
+    def __init__(self, person_id, box):
+
+        self.person_id = person_id
+
+        self.x, self.y, self.w, self.h = box
+
+        self.center = self.get_center(box)
+
+        self.emotion_history = deque(
+            maxlen=EMOTION_HISTORY_SIZE
+        )
+
+        self.confidence_history = deque(
+            maxlen=EMOTION_HISTORY_SIZE
+        )
+
+        self.current_emotion = "Detecting..."
+
+        self.current_confidence = 0.0
+
+        self.missing_frames = 0
+
+        self.last_seen = time.time()
+
+    @staticmethod
+    def get_center(box):
+
+        x, y, w, h = box
+
+        return (
+            x + w // 2,
+            y + h // 2,
+        )
+
+    def update(self, box):
+
+        self.x, self.y, self.w, self.h = box
+
+        self.center = self.get_center(box)
+
+        self.missing_frames = 0
+
+        self.last_seen = time.time()
+
+    def add_prediction(
+        self,
+        emotion,
+        confidence,
+    ):
+
+        self.emotion_history.append(
+            emotion
+        )
+
+        self.confidence_history.append(
+            confidence
+        )
+
+        # ----------------------------------------------------------
+        # Find most common emotion
+        # ----------------------------------------------------------
+
+        counts = Counter(
+            self.emotion_history
+        )
+
+        most_common_emotion, count = (
+            counts.most_common(1)[0]
+        )
+
+        # ----------------------------------------------------------
+        # Only change emotion after enough consistent predictions
+        # ----------------------------------------------------------
+
+        if count >= MIN_STABLE_COUNT:
+
+            self.current_emotion = (
+                most_common_emotion
+            )
+
+            matching_confidences = [
+                conf
+                for emo, conf in zip(
+                    self.emotion_history,
+                    self.confidence_history,
+                )
+                if emo == most_common_emotion
+            ]
+
+            if matching_confidences:
+
+                self.current_confidence = float(
+                    np.mean(
+                        matching_confidences
+                    )
+                )
+
+        return (
+            self.current_emotion,
+            self.current_confidence,
+        )
+
+
+# ======================================================================
+# FACE TRACKER
+# ======================================================================
+
+class FaceTracker:
+
+    def __init__(self):
+
+        self.people = {}
+
+        self.next_person_id = 1
+
+    def _distance(
+        self,
+        point1,
+        point2,
+    ):
+
+        return np.sqrt(
+            (point1[0] - point2[0]) ** 2
+            + (point1[1] - point2[1]) ** 2
+        )
+
+    def update(self, detected_faces):
+
+        """
+        Match newly detected faces with existing people.
+        """
+
+        if not detected_faces:
+
+            for person in self.people.values():
+
+                person.missing_frames += 1
+
+            self._remove_old_people()
+
+            return []
+
+        current_centers = []
+
+        for box in detected_faces:
+
+            x, y, w, h = box
+
+            center = (
+                x + w // 2,
+                y + h // 2,
+            )
+
+            current_centers.append(
+                center
+            )
+
+        matched_people = set()
+
+        results = []
+
+        # --------------------------------------------------------------
+        # Match each detected face
+        # --------------------------------------------------------------
+
+        for box, center in zip(
+            detected_faces,
+            current_centers,
+        ):
+
+            best_person = None
+
+            best_distance = float("inf")
+
+            for person_id, person in self.people.items():
+
+                if person_id in matched_people:
+                    continue
+
+                distance = self._distance(
+                    center,
+                    person.center,
+                )
+
+                if (
+                    distance
+                    < best_distance
+                    and distance
+                    <= MAX_TRACK_DISTANCE
+                ):
+
+                    best_distance = distance
+
+                    best_person = person
+
+            # ----------------------------------------------------------
+            # Existing person
+            # ----------------------------------------------------------
+
+            if best_person is not None:
+
+                best_person.update(box)
+
+                matched_people.add(
+                    best_person.person_id
+                )
+
+                results.append(
+                    best_person
+                )
+
+            # ----------------------------------------------------------
+            # New person
+            # ----------------------------------------------------------
+
+            else:
+
+                person = PersonTrack(
+                    self.next_person_id,
+                    box,
+                )
+
+                self.people[
+                    self.next_person_id
+                ] = person
+
+                matched_people.add(
+                    self.next_person_id
+                )
+
+                self.next_person_id += 1
+
+                results.append(
+                    person
+                )
+
+        # --------------------------------------------------------------
+        # Mark unmatched people
+        # --------------------------------------------------------------
+
+        for person_id, person in self.people.items():
+
+            if person_id not in matched_people:
+
+                person.missing_frames += 1
+
+        self._remove_old_people()
+
+        return results
+
+    def _remove_old_people(self):
+
+        remove_ids = []
+
+        for person_id, person in self.people.items():
+
+            if (
+                person.missing_frames
+                > MAX_MISSING_FRAMES
+            ):
+
+                remove_ids.append(
+                    person_id
+                )
+
+        for person_id in remove_ids:
+
+            del self.people[
+                person_id
+            ]
+
+
+# ======================================================================
+# COLOR FUNCTIONS
+# ======================================================================
+
+def get_emotion_color(emotion):
+
+    colors = {
+
+        "Happy": (
+            0,
+            255,
+            0,
+        ),
+
+        "Sad": (
+            255,
+            100,
+            100,
+        ),
+
+        "Angry": (
+            0,
+            0,
+            255,
+        ),
+
+        "Surprise": (
+            0,
+            165,
+            255,
+        ),
+
+        "Neutral": (
+            200,
+            200,
+            200,
+        ),
+
+    }
+
+    return colors.get(
+        emotion,
+        (
+            0,
+            255,
+            255,
+        ),
+    )
+
+
+# ======================================================================
+# DRAW PERSON
+# ======================================================================
+
+def draw_person(
+    frame,
+    person,
+):
+
+    x = person.x
+    y = person.y
+    w = person.w
+    h = person.h
+
+    emotion = person.current_emotion
+
+    confidence = person.current_confidence
+
+    color = get_emotion_color(
+        emotion
+    )
+
+    # --------------------------------------------------------------
+    # Face rectangle
+    # --------------------------------------------------------------
+
+    cv2.rectangle(
+        frame,
+        (x, y),
+        (x + w, y + h),
+        color,
+        3,
+    )
+
+    # --------------------------------------------------------------
+    # Person ID
+    # --------------------------------------------------------------
+
+    person_text = (
+        f"Person {person.person_id}"
+    )
+
+    cv2.putText(
+        frame,
+        person_text,
+        (x, y + h + 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        color,
+        2,
+    )
+
+    # --------------------------------------------------------------
+    # Emotion label
+    # --------------------------------------------------------------
+
+    if emotion != "Detecting...":
+
+        emotion_text = (
+            f"{emotion} "
+            f"({confidence:.0f}%)"
+        )
+
     else:
-        return "", "*Robot observing*"
+
+        emotion_text = emotion
+
+    # Background for label
+    (text_w, text_h), _ = cv2.getTextSize(
+        emotion_text,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        2,
+    )
+
+    label_y = max(
+        text_h + 10,
+        y - 8,
+    )
+
+    cv2.rectangle(
+        frame,
+        (
+            x,
+            label_y - text_h - 8,
+        ),
+        (
+            x + text_w + 10,
+            label_y + 5,
+        ),
+        color,
+        -1,
+    )
+
+    # Use black text for readability
+    cv2.putText(
+        frame,
+        emotion_text,
+        (x + 5, label_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 0, 0),
+        2,
+    )
+
+    # --------------------------------------------------------------
+    # Confidence bar
+    # --------------------------------------------------------------
+
+    if confidence > 0:
+
+        bar_width = w
+
+        filled_width = int(
+            bar_width
+            * min(confidence, 100)
+            / 100
+        )
+
+        bar_y = y + h + 35
+
+        cv2.rectangle(
+            frame,
+            (x, bar_y),
+            (
+                x + bar_width,
+                bar_y + 8,
+            ),
+            (50, 50, 50),
+            -1,
+        )
+
+        cv2.rectangle(
+            frame,
+            (x, bar_y),
+            (
+                x + filled_width,
+                bar_y + 8,
+            ),
+            color,
+            -1,
+        )
+
+
+# ======================================================================
+# VOICE FUNCTION
+# ======================================================================
+
+def speak_reaction(
+    engine,
+    emotion,
+):
+
+    if emotion not in REACTIONS:
+
+        return
+
+    message = REACTIONS[
+        emotion
+    ]
+
+    print(
+        f"Voice reaction: {message}"
+    )
+
+    engine.say(
+        message
+    )
+
+    engine.runAndWait()
+
+
+# ======================================================================
+# MAIN
+# ======================================================================
 
 def main():
-    model_path = 'emotion_detection_model.keras'
-    if not os.path.exists(model_path):
-        raise FileNotFoundError("Trained model file not found. Run train.py first.")
 
-    model = tf.keras.models.load_model(model_path)
-    class_names = ['Angry', 'Happy', 'Neutral', 'Sad', 'Suprise']
+    print("=" * 65)
+    print("MULTI-PERSON EMOTION DETECTION")
+    print("=" * 65)
 
-    # --- Initialize MediaPipe Face Detection ---
-    mp_face_detection = mp.solutions.face_detection
-    # model_selection=0 is optimized for faces within 2 meters (perfect for robots)
-    face_detection = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.6)
+    # --------------------------------------------------------------
+    # Load model
+    # --------------------------------------------------------------
 
-    print("--> Launching Interface. Press 'q' to shut down demo.")
-    cap = cv2.VideoCapture(0)
+    print("Loading model...")
 
-    # --- STABILIZATION VARIABLES ---
-    STABILITY_THRESHOLD = 1.5  
-    candidate_emotion = "Neutral"
-    emotion_start_time = time.time()
-    
-    current_stable_emotion = "Neutral"
-    last_spoken_emotion = None
-    
-    # Optional: Setup fullscreen for the robot face (uncomment when on hardware)
-    # cv2.namedWindow('Robot Interaction Operating Console', cv2.WND_PROP_FULLSCREEN)
-    # cv2.setWindowProperty('Robot Interaction Operating Console', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    model = load_emotion_model(
+        MODEL_PATH
+    )
+
+    # --------------------------------------------------------------
+    # Face detector
+    # --------------------------------------------------------------
+
+    print(
+        "Loading face detector..."
+    )
+
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades
+        + "haarcascade_frontalface_default.xml"
+    )
+
+    if face_cascade.empty():
+
+        raise RuntimeError(
+            "Could not load OpenCV Haar cascade."
+        )
+
+    # --------------------------------------------------------------
+    # Voice engine
+    # --------------------------------------------------------------
+
+    engine = None
+
+    if VOICE_ENABLED:
+
+        print(
+            "Starting voice engine..."
+        )
+
+        engine = pyttsx3.init()
+
+        engine.setProperty(
+            "rate",
+            150,
+        )
+
+    # --------------------------------------------------------------
+    # Camera
+    # --------------------------------------------------------------
+
+    print(
+        "Starting webcam..."
+    )
+
+    cap = cv2.VideoCapture(
+        CAMERA_INDEX
+    )
+
+    if not cap.isOpened():
+
+        raise RuntimeError(
+            "Could not open webcam."
+        )
+
+    # Try to use HD resolution
+    cap.set(
+        cv2.CAP_PROP_FRAME_WIDTH,
+        CAMERA_WIDTH,
+    )
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_HEIGHT,
+        CAMERA_HEIGHT,
+    )
+
+    # --------------------------------------------------------------
+    # Face tracker
+    # --------------------------------------------------------------
+
+    tracker = FaceTracker()
+
+    # --------------------------------------------------------------
+    # Voice state
+    # --------------------------------------------------------------
+
+    last_spoken = {}
+
+    last_speak_time = {}
+
+    print("=" * 65)
+    print("READY!")
+    print(
+        "Press 'q' to quit."
+    )
+    print("=" * 65)
+
+    # ==================================================================
+    # MAIN CAMERA LOOP
+    # ==================================================================
 
     while True:
+
         ret, frame = cap.read()
+
         if not ret:
+
+            print(
+                "Camera read failed."
+            )
+
             break
-            
-        frame = cv2.resize(frame, (500, 400))
-        ih, iw, _ = frame.shape
-        
-        # MediaPipe requires RGB images, but OpenCV reads in BGR
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) # Still needed for your Emotion Model
-        
-        # Detect faces using MediaPipe
-        results = face_detection.process(rgb_frame)
-        detected_this_frame = False
 
-        if results.detections:
-            detected_this_frame = True
-            
-            # Grab the first face found
-            detection = results.detections[0]
-            bboxC = detection.location_data.relative_bounding_box
-            
-            # MediaPipe returns normalized coordinates (0.0 to 1.0). Convert to pixel coordinates.
-            x = int(bboxC.xmin * iw)
-            y = int(bboxC.ymin * ih)
-            w = int(bboxC.width * iw)
-            h = int(bboxC.height * ih)
-            
-            # Safety checks: Ensure bounding box stays within the frame to avoid crashes
-            x, y = max(0, x), max(0, y)
-            if x + w > iw: w = iw - x
-            if y + h > ih: h = ih - y
-            
-            if w > 0 and h > 0:
-                # 1. Classify Emotion
-                roi_gray = gray_frame[y:y+h, x:x+w]
-                roi_gray = cv2.resize(roi_gray, (48, 48))
-                roi = roi_gray.astype('float32') / 255.0
-                roi = np.expand_dims(roi, axis=0)
-                roi = np.expand_dims(roi, axis=-1)
-                
-                # Get the raw probabilities for all 5 emotions
-                prediction_array = model.predict(roi, verbose=0)[0]
-                max_index = int(np.argmax(prediction_array))
-                predicted_emotion = class_names[max_index]
-                confidence = prediction_array[max_index]
-                
-                # --- BIAS CORRECTION FILTER ---
-                # If it guesses a negative emotion but isn't highly confident, 
-                # override it to Neutral (fixes the Resting Face bias).
-                # --- BIAS CORRECTION FILTER ---
-                # Lowered to 45%. If the AI is less than 45% sure, it defaults to Neutral.
-                if predicted_emotion in ['Sad', 'Angry', 'Suprise'] and confidence < 0.45:
-                    predicted_emotion = 'Neutral'
-                    
-                # Print to terminal so you can see the robot's "thoughts"
-                print(f"Raw AI Guess: {class_names[max_index]} ({confidence*100:.1f}%) -> Final Output: {predicted_emotion}")
-                
-                
-                # Draw tracking box on operator view
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 255), 2)
-                cv2.putText(frame, f"Detecting: {predicted_emotion}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                
-                # --- EMOTION TIMER LOGIC ---
-                if predicted_emotion == candidate_emotion:
-                    if time.time() - emotion_start_time >= STABILITY_THRESHOLD:
-                        current_stable_emotion = candidate_emotion
-                else:
-                    candidate_emotion = predicted_emotion
-                    emotion_start_time = time.time()
+        # ----------------------------------------------------------
+        # Mirror camera
+        # ----------------------------------------------------------
 
-        if not detected_this_frame:
-            candidate_emotion = "Neutral"
-            current_stable_emotion = "Neutral"
+        frame = cv2.flip(
+            frame,
+            1,
+        )
 
-        # 2. Extract Speech and Action rules
-        speech_phrase, action_text = handle_robot_reaction(current_stable_emotion)
+        # ----------------------------------------------------------
+        # Grayscale
+        # ----------------------------------------------------------
 
-        # 3. Handle Voice Event Triggers 
-        if current_stable_emotion != last_spoken_emotion and speech_phrase != "":
-            robot_speak(speech_phrase)
-            last_spoken_emotion = current_stable_emotion
-        elif current_stable_emotion == "Neutral":
-            last_spoken_emotion = None 
+        gray = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2GRAY,
+        )
 
-        # 4. Generate the Face Element 
-        robot_face_img = draw_robot_face(current_stable_emotion)
+        # ----------------------------------------------------------
+        # Improve contrast
+        # ----------------------------------------------------------
 
-        # 5. Composite UI Panel
-        combined_ui = np.hstack((frame, robot_face_img))
-        
-        cv2.rectangle(combined_ui, (0, 365), (900, 400), (20, 20, 20), -1)
-        
-        cv2.putText(combined_ui, f"Stable State: {current_stable_emotion.upper()}", (20, 390), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(combined_ui, f"Action: {action_text}", (520, 390), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        gray = cv2.equalizeHist(
+            gray
+        )
 
-        cv2.imshow('Robot Interaction Operating Console', combined_ui)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # ----------------------------------------------------------
+        # Detect faces
+        # ----------------------------------------------------------
+
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=FACE_SCALE_FACTOR,
+            minNeighbors=FACE_MIN_NEIGHBORS,
+            minSize=FACE_MIN_SIZE,
+        )
+
+        # Convert to regular list
+        detected_faces = [
+            (
+                int(x),
+                int(y),
+                int(w),
+                int(h),
+            )
+            for (
+                x,
+                y,
+                w,
+                h,
+            ) in faces
+        ]
+
+        # ----------------------------------------------------------
+        # Update tracker
+        # ----------------------------------------------------------
+
+        people = tracker.update(
+            detected_faces
+        )
+
+        # ----------------------------------------------------------
+        # Process every person
+        # ----------------------------------------------------------
+
+        for person in people:
+
+            x = person.x
+            y = person.y
+            w = person.w
+            h = person.h
+
+            # ------------------------------------------------------
+            # Make sure coordinates are valid
+            # ------------------------------------------------------
+
+            x1 = max(
+                0,
+                x,
+            )
+
+            y1 = max(
+                0,
+                y,
+            )
+
+            x2 = min(
+                gray.shape[1],
+                x + w,
+            )
+
+            y2 = min(
+                gray.shape[0],
+                y + h,
+            )
+
+            if (
+                x2 <= x1
+                or y2 <= y1
+            ):
+
+                continue
+
+            # ------------------------------------------------------
+            # Crop face
+            # ------------------------------------------------------
+
+            roi = gray[
+                y1:y2,
+                x1:x2,
+            ]
+
+            if roi.size == 0:
+
+                continue
+
+            # ------------------------------------------------------
+            # Resize
+            # ------------------------------------------------------
+
+            roi = cv2.resize(
+                roi,
+                (48, 48),
+                interpolation=cv2.INTER_AREA,
+            )
+
+            # ------------------------------------------------------
+            # Normalize
+            # ------------------------------------------------------
+
+            roi = (
+                roi.astype(
+                    np.float32
+                )
+                / 255.0
+            )
+
+            # ------------------------------------------------------
+            # Model input
+            # ------------------------------------------------------
+
+            roi = roi.reshape(
+                1,
+                48,
+                48,
+                1,
+            )
+
+            # ------------------------------------------------------
+            # Prediction
+            # ------------------------------------------------------
+
+            prediction = model.predict(
+                roi,
+                verbose=0,
+            )[0]
+
+            # ------------------------------------------------------
+            # Best emotion
+            # ------------------------------------------------------
+
+            idx = int(
+                np.argmax(
+                    prediction
+                )
+            )
+
+            emotion = EMOTIONS[
+                idx
+            ]
+
+            confidence = float(
+                prediction[idx]
+                * 100
+            )
+
+            # ------------------------------------------------------
+            # Add prediction to person's history
+            # ------------------------------------------------------
+
+            old_emotion = (
+                person.current_emotion
+            )
+
+            new_emotion, new_confidence = (
+                person.add_prediction(
+                    emotion,
+                    confidence,
+                )
+            )
+
+            # ------------------------------------------------------
+            # Draw
+            # ------------------------------------------------------
+
+            draw_person(
+                frame,
+                person,
+            )
+
+            # ------------------------------------------------------
+            # Voice reaction
+            # ------------------------------------------------------
+
+            if (
+                VOICE_ENABLED
+                and new_emotion in REACTIONS
+            ):
+
+                current_time = time.time()
+
+                previous_spoken = (
+                    last_spoken.get(
+                        person.person_id
+                    )
+                )
+
+                previous_time = (
+                    last_speak_time.get(
+                        person.person_id,
+                        0,
+                    )
+                )
+
+                emotion_changed = (
+                    new_emotion
+                    != previous_spoken
+                )
+
+                enough_time = (
+                    current_time
+                    - previous_time
+                    >= SPEAK_COOLDOWN
+                )
+
+                if (
+                    emotion_changed
+                    and enough_time
+                ):
+
+                    print(
+                        f"Person "
+                        f"{person.person_id}: "
+                        f"{new_emotion}"
+                    )
+
+                    speak_reaction(
+                        engine,
+                        new_emotion,
+                    )
+
+                    last_spoken[
+                        person.person_id
+                    ] = new_emotion
+
+                    last_speak_time[
+                        person.person_id
+                    ] = current_time
+
+        # ==============================================================
+        # TOP STATUS BAR
+        # ==============================================================
+
+        overlay = frame.copy()
+
+        cv2.rectangle(
+            overlay,
+            (0, 0),
+            (
+                frame.shape[1],
+                55,
+            ),
+            (20, 20, 20),
+            -1,
+        )
+
+        # Slight transparency
+        frame = cv2.addWeighted(
+            overlay,
+            0.75,
+            frame,
+            0.25,
+            0,
+        )
+
+        # --------------------------------------------------------------
+        # Title
+        # --------------------------------------------------------------
+
+        cv2.putText(
+            frame,
+            "MULTI-PERSON EMOTION DETECTION",
+            (15, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+        )
+
+        # --------------------------------------------------------------
+        # People count
+        # --------------------------------------------------------------
+
+        count_text = (
+            f"People: {len(people)}"
+        )
+
+        cv2.putText(
+            frame,
+            count_text,
+            (
+                frame.shape[1] - 150,
+                25,
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 255),
+            2,
+        )
+
+        # --------------------------------------------------------------
+        # Instructions
+        # --------------------------------------------------------------
+
+        cv2.putText(
+            frame,
+            "Press Q to quit",
+            (
+                15,
+                frame.shape[0] - 15,
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (220, 220, 220),
+            1,
+        )
+
+        # --------------------------------------------------------------
+        # Show frame
+        # --------------------------------------------------------------
+
+        cv2.imshow(
+            "Multi-Person Emotion Detection",
+            frame,
+        )
+
+        # --------------------------------------------------------------
+        # Quit
+        # --------------------------------------------------------------
+
+        key = (
+            cv2.waitKey(1)
+            & 0xFF
+        )
+
+        if key == ord("q"):
+
             break
+
+    # ==================================================================
+    # CLEANUP
+    # ==================================================================
+
+    print(
+        "Stopping..."
+    )
 
     cap.release()
+
     cv2.destroyAllWindows()
 
-if __name__ == '__main__':
+    print(
+        "Program ended."
+    )
+
+
+# ======================================================================
+# ENTRY POINT
+# ======================================================================
+
+if __name__ == "__main__":
+
     main()
